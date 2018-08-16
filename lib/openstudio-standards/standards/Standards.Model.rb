@@ -1,3 +1,6 @@
+require 'csv'
+
+
 class Standard
   attr_accessor :space_multiplier_map
 
@@ -208,13 +211,8 @@ class Standard
     # Temporary workaround for OS issue #2598
     model_temp_fix_ems_references(model)
 
-    # Delete all the unused curves
-    model.getCurves.sort.each do |curve|
-      if curve.directUseCount == 0
-        OpenStudio::logFree(OpenStudio::Debug, 'openstudio.standards.Model', "#{curve.name} is unused; it will be removed.")
-        model.removeObject(curve.handle)
-      end
-    end
+    # Delete all the unused resource objects
+    model_remove_unused_resource_objects(model)
 
     # TODO: turn off self shading
     # Set Solar Distribution to MinimalShadowing... problem is when you also have detached shading such as surrounding buildings etc
@@ -254,7 +252,7 @@ class Standard
       end
     end
 
-    return { 'residential' => res_area_m2, 'nonresidential' => nonres_area_m2 }
+    return {'residential' => res_area_m2, 'nonresidential' => nonres_area_m2}
   end
 
   # Determine the number of stories spanned by the supplied zones.
@@ -365,8 +363,8 @@ class Standard
     end
 
     # Group the zones by occupancy type
-    type_to_area = Hash.new { 0.0 }
-    zones_grouped_by_occ = zones.group_by { |z| z['occ'] }
+    type_to_area = Hash.new {0.0}
+    zones_grouped_by_occ = zones.group_by {|z| z['occ']}
 
     # Determine the dominant occupancy type by area
     zones_grouped_by_occ.each do |occ_type, zns|
@@ -374,7 +372,7 @@ class Standard
         type_to_area[occ_type] += zn['area']
       end
     end
-    dom_occ = type_to_area.sort_by { |k, v| v }.reverse[0][0]
+    dom_occ = type_to_area.sort_by {|k, v| v}.reverse[0][0]
 
     # Get the dominant occupancy type group
     dom_occ_group = zones_grouped_by_occ[dom_occ]
@@ -623,7 +621,7 @@ class Standard
     fuel_type = model_prm_baseline_system_change_fuel_type(model, fuel_type, climate_zone, custom)
 
     # Define the lookup by row and by fuel type
-    sys_lookup = Hash.new { |h, k| h[k] = Hash.new(&h.default_proc) }
+    sys_lookup = Hash.new {|h, k| h[k] = Hash.new(&h.default_proc)}
 
     # fossil, fossil and electric, purchased heat, purchased heat and cooling
     sys_lookup['1_or_2']['fossil'] = ['PTAC', 'NaturalGas', nil, 'Electricity']
@@ -1358,7 +1356,7 @@ class Standard
       OpenStudio.logFree(OpenStudio::Info, 'openstudio.Standards.Model', "Secondary system zones = #{sec_zone_names.join(', ')}.")
     end
 
-    return { 'primary' => pri_zones, 'secondary' => sec_zones }
+    return {'primary' => pri_zones, 'secondary' => sec_zones}
   end
 
   # Group an array of zones into multiple arrays, one for each story in the building.
@@ -1427,7 +1425,7 @@ class Standard
     end
 
     # Pre-sort spaces
-    sorted_spaces = sorted_spaces.sort_by { |a| a[1] }
+    sorted_spaces = sorted_spaces.sort_by {|a| a[1]}
 
     # Take the sorted list and assign/make stories
     sorted_spaces.each do |space|
@@ -1654,6 +1652,9 @@ class Standard
     # Plant Loop Controls
     # TODO refactor: enable this code (missing before refactor)
     # getPlantLoops.sort.each { |obj| plant_loop_apply_standard_controls(obj, template, climate_zone) }
+
+    # Zone HVAC Controls
+    model.getZoneHVACComponents.sort.each { |obj| zone_hvac_component_apply_standard_controls(obj) }
 
     ##### Apply equipment efficiencies
 
@@ -2115,7 +2116,7 @@ class Standard
     end
 
     # Make a schedule ruleset
-    sch_ruleset = OpenStudio::Model::ScheduleRuleset.new( model )
+    sch_ruleset = OpenStudio::Model::ScheduleRuleset.new(model)
     sch_ruleset.setName(schedule_name.to_s)
 
     # Loop through the rules, making one for each row in the spreadsheet
@@ -2293,7 +2294,7 @@ class Standard
       end
 
     else
-      puts "Unknown material type #{material_type}"
+      OpenStudio.logFree(OpenStudio::Error, 'openstudio.standards.Model', "Unknown material type #{material_type}, cannot add material called #{material_name}.")
       exit
     end
 
@@ -2389,6 +2390,43 @@ class Standard
 
       end
 
+      # If the construction has a skylight framing material specified,
+      # get the skylight frame material properties and add frame to
+      # all skylights in the model.
+      if data['skylight_framing']
+        # Get the skylight framing material
+        framing_name = data['skylight_framing']
+        frame_data = model_find_object(standards_data['materials'], 'name' => framing_name)
+        if frame_data
+          frame_width_in = frame_data['frame_width'].to_f
+          frame_with_m = OpenStudio.convert(frame_width_in, 'in', 'm').get
+          frame_resistance_ip = frame_data['resistance'].to_f
+          frame_resistance_si = OpenStudio.convert(frame_resistance_ip, 'hr*ft^2*R/Btu', 'm^2*K/W').get
+          frame_conductance_si = 1.0/frame_resistance_si
+          frame = OpenStudio::Model::WindowPropertyFrameAndDivider.new(model)
+          frame.setName("Skylight frame R-#{frame_resistance_ip.round(2)} #{frame_width_in.round(1)} in. wide")
+          frame.setFrameWidth(frame_with_m)
+          frame.setFrameConductance(frame_conductance_si)
+          skylights_frame_added = 0
+          model.getSubSurfaces.each do |sub_surface|
+            next unless sub_surface.outsideBoundaryCondition == 'Outdoors' && sub_surface.subSurfaceType == 'Skylight'
+            # todo enable proper window frame setting after https://github.com/NREL/OpenStudio/issues/2895 is fixed
+            sub_surface.setString(8, frame.name.get.to_s)
+            skylights_frame_added += 1
+            # if sub_surface.allowWindowPropertyFrameAndDivider
+            #   sub_surface.setWindowPropertyFrameAndDivider(frame)
+            #   skylights_frame_added += 1
+            # else
+            #   OpenStudio.logFree(OpenStudio::Warn, 'openstudio.standards.Model', "For #{sub_surface.name}: cannot add a frame to this skylight.")
+            # end
+          end
+          OpenStudio.logFree(OpenStudio::Info, 'openstudio.standards.Model', "Adding #{frame.name} to #{skylights_frame_added} skylights.") if skylights_frame_added > 0
+        else
+          OpenStudio.logFree(OpenStudio::Warn, 'openstudio.standards.Model', "Cannot find skylight framing data for: #{framing_name}, will not be created.")
+          return false # TODO: change to return empty optional material
+        end
+      end
+
     end
     #     # Check if the construction with the modified name was already in the model.
     #     # If it was, delete this new construction and return the copy already in the model.
@@ -2426,11 +2464,12 @@ class Standard
     # which specifies properties by construction category by climate zone set.
     # AKA the info in Tables 5.5-1-5.5-8
 
-    props = model_find_object(standards_data['construction_properties'], 'template' => template,
-                                                                         'climate_zone_set' => climate_zone_set,
-                                                                         'intended_surface_type' => intended_surface_type,
-                                                                         'standards_construction_type' => standards_construction_type,
-                                                                         'building_category' => building_category)
+    props = model_find_object(standards_data['construction_properties'],
+                              'template' => template,
+                              'climate_zone_set' => climate_zone_set,
+                              'intended_surface_type' => intended_surface_type,
+                              'standards_construction_type' => standards_construction_type,
+                              'building_category' => building_category)
 
     if !props
       OpenStudio.logFree(OpenStudio::Error, 'openstudio.standards.Model', "Could not find construction properties for: #{template}-#{climate_zone_set}-#{intended_surface_type}-#{standards_construction_type}-#{building_category}.")
@@ -2474,11 +2513,16 @@ class Standard
 
     data = model_find_object(standards_data['construction_sets'], 'template' => template, 'climate_zone_set' => climate_zone_set, 'building_type' => building_type, 'space_type' => spc_type, 'is_residential' => is_residential)
     unless data
+      # Search again without the is_residential criteria in the case that this field is not specified for a standard
       data = model_find_object(standards_data['construction_sets'], 'template' => template, 'climate_zone_set' => climate_zone_set, 'building_type' => building_type, 'space_type' => spc_type)
       unless data
-        # if nothing matches say that we could not find it.
-        OpenStudio.logFree(OpenStudio::Info, 'openstudio.model.Model', "Construction set for template =#{template}, climate zone set =#{climate_zone_set}, building type = #{building_type}, space type = #{spc_type}, is residential = #{is_residential} was not found in standards_data['construction_sets']")
-        return construction_set
+        # Search again without the building type to find attics
+        data = model_find_object(standards_data['construction_sets'], 'template' => template, 'climate_zone_set' => climate_zone_set, 'space_type' => spc_type, 'is_residential' => is_residential)
+        unless data
+          # if nothing matches say that we could not find it.
+          OpenStudio.logFree(OpenStudio::Info, 'openstudio.model.Model', "Construction set for template =#{template}, climate zone set =#{climate_zone_set}, building type = #{building_type}, space type = #{spc_type}, is residential = #{is_residential} was not found in standards_data['construction_sets']")
+          return construction_set
+        end
       end
     end
 
@@ -2493,12 +2537,18 @@ class Standard
     # Exterior surfaces constructions
     exterior_surfaces = OpenStudio::Model::DefaultSurfaceConstructions.new(model)
     construction_set.setDefaultExteriorSurfaceConstructions(exterior_surfaces)
-    if data['exterior_floor_standards_construction_type'] && data['exterior_floor_building_category']
-      exterior_surfaces.setFloorConstruction(model_find_and_add_construction(model,
-                                                                             climate_zone_set,
-                                                                             'ExteriorFloor',
-                                                                             data['exterior_floor_standards_construction_type'],
-                                                                             data['exterior_floor_building_category']))
+    # Special condition for attics, where the insulation is actually on the floor
+    # but the soffit is uninsulated
+    if spc_type == 'Attic'
+      exterior_surfaces.setFloorConstruction(model_add_construction(model, 'Typical Attic Soffit'))
+    else
+      if data['exterior_floor_standards_construction_type'] && data['exterior_floor_building_category']
+        exterior_surfaces.setFloorConstruction(model_find_and_add_construction(model,
+                                                                               climate_zone_set,
+                                                                               'ExteriorFloor',
+                                                                               data['exterior_floor_standards_construction_type'],
+                                                                               data['exterior_floor_building_category']))
+      end
     end
     if data['exterior_wall_standards_construction_type'] && data['exterior_wall_building_category']
       exterior_surfaces.setWallConstruction(model_find_and_add_construction(model,
@@ -2507,20 +2557,40 @@ class Standard
                                                                             data['exterior_wall_standards_construction_type'],
                                                                             data['exterior_wall_building_category']))
     end
-    if data['exterior_roof_standards_construction_type'] && data['exterior_roof_building_category']
-      exterior_surfaces.setRoofCeilingConstruction(model_find_and_add_construction(model,
-                                                                                   climate_zone_set,
-                                                                                   'ExteriorRoof',
-                                                                                   data['exterior_roof_standards_construction_type'],
-                                                                                   data['exterior_roof_building_category']))
+    # Special condition for attics, where the insulation is actually on the floor
+    # and the roof itself is uninsulated
+    if spc_type == 'Attic'
+      if data['exterior_roof_standards_construction_type'] && data['exterior_roof_building_category']
+        exterior_surfaces.setRoofCeilingConstruction(model_add_construction(model, 'Typical Uninsulated Wood Joist Attic Roof'))
+      end
+    else
+      if data['exterior_roof_standards_construction_type'] && data['exterior_roof_building_category']
+        exterior_surfaces.setRoofCeilingConstruction(model_find_and_add_construction(model,
+                                                                                     climate_zone_set,
+                                                                                     'ExteriorRoof',
+                                                                                     data['exterior_roof_standards_construction_type'],
+                                                                                     data['exterior_roof_building_category']))
+      end
     end
-
     # Interior surfaces constructions
     interior_surfaces = OpenStudio::Model::DefaultSurfaceConstructions.new(model)
     construction_set.setDefaultInteriorSurfaceConstructions(interior_surfaces)
     construction_name = data['interior_floors']
-    unless construction_name.nil?
-      interior_surfaces.setFloorConstruction(model_add_construction(model, construction_name))
+    # Special condition for attics, where the insulation is actually on the floor
+    # and the roof itself is uninsulated
+    if spc_type == 'Attic'
+      if data['exterior_roof_standards_construction_type'] && data['exterior_roof_building_category']
+        interior_surfaces.setFloorConstruction(model_find_and_add_construction(model,
+                                                                               climate_zone_set,
+                                                                               'ExteriorRoof',
+                                                                               data['exterior_roof_standards_construction_type'],
+                                                                               data['exterior_roof_building_category']))
+
+      end
+    else
+      unless construction_name.nil?
+        interior_surfaces.setFloorConstruction(model_add_construction(model, construction_name))
+      end
     end
     construction_name = data['interior_walls']
     unless construction_name.nil?
@@ -2787,47 +2857,78 @@ class Standard
     return full_epw_path
   end
 
+  # Find the legacy simulation results from a CSV of previously created results.
+  #
+  # @return [Hash] a hash of results for each fuel, where the keys are in the form 'End Use|Fuel Type',
+  # e.g. Heating|Electricity, Exterior Equipment|Water.  All end use/fuel type combos are present, with
+  # values of 0.0 if none of this end use/fuel type combo was used by the simulation.  Returns nil
+  # if the legacy results couldn't be found.
+  def model_legacy_results_by_end_use_and_fuel_type(model, climate_zone, building_type)
+    # Load the legacy idf results CSV file into a ruby hash
+    top_dir = File.expand_path('../../..', File.dirname(__FILE__))
+    standards_data_dir = "#{top_dir}/data/standards"
+    temp = ''
+    # Run differently depending on whether running from embedded filesystem in OpenStudio CLI or not
+    if __dir__[0] == ':' # Running from OpenStudio CLI
+      # load file from embedded files
+      temp = load_resource_relative('../../../data/standards/legacy_idf_results.csv', 'r:UTF-8')
+    else
+      # loaded gem from system path
+      temp = File.read("#{standards_data_dir}/legacy_idf_results.csv")
+    end
+    legacy_idf_csv = CSV.new(temp, :headers => true, :converters => :all)
+    legacy_idf_results = legacy_idf_csv.to_a.map {|row| row.to_hash }
+
+    # Get the results for this building
+    search_criteria = {
+        'Building Type' => building_type,
+        'Template' => template,
+        'Climate Zone' => climate_zone
+    }
+    energy_values = model_find_object(legacy_idf_results, search_criteria)
+    if energy_values.nil?
+      OpenStudio.logFree(OpenStudio::Error, 'openstudio.standards.Model', "Could not find legacy simulation results for #{search_criteria}")
+      return {}
+    end
+
+    return energy_values
+  end
+
   # Method to gather prototype simulation results for a specific climate zone, building type, and template
   #
   # @param climate_zone [String] string for the ASHRAE climate zone.
   # @param building_type [String] string for prototype building type.
   # @return [Hash] Returns a hash with data presented in various bins. Returns nil if no search results
   def model_process_results_for_datapoint(model, climate_zone, building_type)
-    # Combine the data from the JSON files into a single hash
-    top_dir = File.expand_path('../../..', File.dirname(__FILE__))
-    standards_data_dir = "#{top_dir}/data/standards"
-
-    # Load the legacy idf results JSON file into a ruby hash
-    temp = ''
-    begin
-      temp = load_resource_relative('../../../data/standards/legacy_idf_results.json', 'r:UTF-8')
-    rescue NoMethodError
-      temp = File.read("#{standards_data_dir}/legacy_idf_results.json")
-    end
-    legacy_idf_results = JSON.parse(temp)
-
-    # List of all fuel types
-    fuel_types = ['Electricity', 'Natural Gas', 'Additional Fuel', 'District Cooling', 'District Heating', 'Water']
-
-    # List of all end uses
-    end_uses = ['Heating', 'Cooling', 'Interior Lighting', 'Exterior Lighting', 'Interior Equipment', 'Exterior Equipment', 'Fans', 'Pumps', 'Heat Rejection', 'Humidification', 'Heat Recovery', 'Water Systems', 'Refrigeration', 'Generators']
-
-    # Get legacy idf results
+    # Hash to store the legacy results by fuel and by end use
     legacy_results_hash = {}
     legacy_results_hash['total_legacy_energy_val'] = 0
     legacy_results_hash['total_legacy_water_val'] = 0
     legacy_results_hash['total_energy_by_fuel'] = {}
     legacy_results_hash['total_energy_by_end_use'] = {}
+
+    # Get the lecay simulation results
+    legacy_values = model_legacy_results_by_end_use_and_fuel_type(model, climate_zone, building_type)
+    if legacy_values.nil?
+      OpenStudio.logFree(OpenStudio::Error, 'openstudio.standards.Model', "Could not find legacy idf results for #{search_criteria}")
+      return legacy_results_hash
+    end
+
+    # List of all fuel types
+    fuel_types = ['Electricity', 'Natural Gas', 'Additional Fuel', 'District Cooling', 'District Heating', 'Water']
+
+    # List of all end uses
+    end_uses = ['Heating', 'Cooling', 'Interior Lighting', 'Exterior Lighting', 'Interior Equipment', 'Exterior Equipment', 'Fans', 'Pumps', 'Heat Rejection','Humidification', 'Heat Recovery', 'Water Systems', 'Refrigeration', 'Generators']
+
+    # Sum the legacy results up by fuel and by end use
     fuel_types.each do |fuel_type|
       end_uses.each do |end_use|
         next if end_use == 'Exterior Equipment'
-
-        # Get the legacy results number
-        legacy_val = legacy_idf_results.dig(building_type, template, climate_zone, fuel_type, end_use)
+        legacy_val = legacy_values["#{end_use}|#{fuel_type}"]
 
         # Combine the exterior lighting and exterior equipment
         if end_use == 'Exterior Lighting'
-          legacy_exterior_equipment = legacy_idf_results.dig(building_type, template, climate_zone, fuel_type, 'Exterior Equipment')
+          legacy_exterior_equipment = legacy_values["Exterior Equipment|#{fuel_type}"]
           unless legacy_exterior_equipment.nil?
             legacy_val += legacy_exterior_equipment
           end
@@ -2921,19 +3022,7 @@ class Standard
   # @return [hash] key for climate zone and building type, both values are strings
   def model_get_building_climate_zone_and_building_type(model, remap_office = true)
     # get climate zone from model
-    # get ashrae climate zone from model
-    climate_zone = ''
-    model.getClimateZones.climateZones.each do |cz|
-      if cz.institution == 'ASHRAE'
-        climate_zone = if cz.value == '7' || cz.value == '8'
-                         "ASHRAE 169-2006-#{cz.value}A"
-                       else
-                         "ASHRAE 169-2006-#{cz.value}"
-                       end
-      elsif cz.institution == 'CEC'
-        climate_zone = "CEC T24-CEC#{cz.value}"
-      end
-    end
+    climate_zone = model_standards_climate_zone(model)
 
     # get building type from model
     building_type = ''
@@ -3365,11 +3454,11 @@ class Standard
 
     # populate search hash
     search_criteria = {
-      'template' => template,
-      'climate_zone_set' => climate_zone_set,
-      'intended_surface_type' => intended_surface_type,
-      'standards_construction_type' => standards_construction_type,
-      'building_category' => building_category
+        'template' => template,
+        'climate_zone_set' => climate_zone_set,
+        'intended_surface_type' => intended_surface_type,
+        'standards_construction_type' => standards_construction_type,
+        'building_category' => building_category
     }
 
     # switch to use this but update test in standards and measures to load this outside of the method
@@ -3844,13 +3933,7 @@ class Standard
     end
 
     # get climate zone value
-    climate_zone_value = ''
-    model.getClimateZones.climateZones.each do |cz|
-      if cz.institution == 'ASHRAE'
-        climate_zone_value = cz.value
-        next
-      end
-    end
+    climate_zone = model_standards_climate_zone(model)
 
     internal_loads = {}
     internal_loads['mech_vent_cfm'] = units_per_bldg * (0.01 * conditioned_floor_area + 7.5 * (bedrooms_per_unit + 1.0))
@@ -4205,6 +4288,238 @@ class Standard
     return space_type_hash.sort.to_h
   end
 
+
+  # This method will apply the a FDWR to a model. It will remove any existing windows and doors and use the
+  # Default contruction to set to apply the window construction. Sill height is in meters
+  def apply_max_fdwr(model, runner, sillHeight_si, wwr)
+    empty_const_warning = false
+    model.getSpaces.sort.each do |space|
+      space.surfaces.sort.each do |surface|
+        zone = surface.space.get.thermalZone
+        zone_multiplier = nil
+        next if zone.empty?
+        if surface.outsideBoundaryCondition == 'Outdoors' and surface.surfaceType == "Wall"
+          surface.subSurfaces.each {|ss| ss.remove}
+          new_window = surface.setWindowToWallRatio(wwr, sillHeight_si, true)
+          raise "#{surface.name.get} did not get set to #{wwr}. The size of the surface is #{surface.grossArea}" unless surface.windowToWallRatio.round(3) == wwr.round(3)
+          if new_window.empty?
+            runner.registerWarning("The requested window to wall ratio for surface '#{surface.name}' was too large. Fenestration was not altered for this surface.")
+          else
+            windows_added = true
+            # warn user if resulting window doesn't have a construction, as it will result in failed simulation. In the future may use logic from starting windows to apply construction to new window.
+            if new_window.get.construction.empty? && (empty_const_warning == false)
+              runner.registerWarning('one or more resulting windows do not have constructions. This script is intended to be used with models using construction sets versus hard assigned constructions.')
+              empty_const_warning = true
+            end
+          end
+        end
+      end
+    end
+  end
+
+  # This method will apply the a SRR to a model. It will remove any existing skylights and use the
+  # Default contruction to set to apply the skylight construction. A default skylight square area of 0.25^2 is used.
+  def apply_max_srr(model, runner, srr, skylight_area = 0.25 * 0.25)
+    spaces = []
+    surface_type = "RoofCeiling"
+    model.getSpaces.sort.each do |space|
+      space.surfaces.sort.each do |surface|
+        if surface.outsideBoundaryCondition == 'Outdoors' and surface.surfaceType == surface_type
+          spaces << space
+          break
+        end
+      end
+    end
+    pattern = OpenStudio::Model.generateSkylightPattern(spaces, spaces[0].directionofRelativeNorth, srr, Math.sqrt(skylight_area), Math.sqrt(skylight_area)) # ratio, x value, y value
+    # applying skylight pattern
+    skylights = OpenStudio::Model.applySkylightPattern(pattern, spaces, OpenStudio::Model::OptionalConstructionBase.new)
+    spacenames = spaces.map {|space| space.name.get}
+    runner.registerInfo("Adding #{skylights.size} skylights to #{spacenames}")
+  end
+
+  # This method will limit the subsurface of a given surface_type ("Wall" or "RoofCeiling") to the ratio for the building.
+  # This method only reduces subsurface sizes at most.
+  def apply_limit_to_subsurface_ratio(model, ratio, surface_type = "Wall")
+    fdwr = get_outdoor_subsurface_ratio(model, surface_type)
+    if fdwr <= ratio
+      OpenStudio.logFree(OpenStudio::Info, 'openstudio.standards.Model', "Building FDWR of #{fdwr} is already lower than limit of #{ratio.round}%.")
+      return true
+    end
+    OpenStudio.logFree(OpenStudio::Info, 'openstudio.standards.Model', "Reducing the size of all windows (by shrinking to centroid) to reduce window area down to the limit of #{ratio.round}%.")
+    # Determine the factors by which to reduce the window / door area
+    mult = ratio / fdwr
+    # Reduce the window area if any of the categories necessary
+    model.getSpaces.sort.each do |space|
+      # Loop through all surfaces in this space
+      space.surfaces.sort.each do |surface|
+        # Skip non-outdoor surfaces
+        next unless surface.outsideBoundaryCondition == 'Outdoors'
+        # Skip non-walls
+        next unless surface.surfaceType == surface_type
+        # Subsurfaces in this surface
+        surface.subSurfaces.sort.each do |ss|
+          # Reduce the size of the window
+          red = 1.0 - mult
+          sub_surface_reduce_area_by_percent_by_shrinking_toward_centroid(ss, red)
+        end
+      end
+    end
+    return true
+  end
+
+  # Converts the climate zone in the model into the format used
+  # by the openstudio-standards lookup tables.  For example:
+  # institution: ASHRAE, value: 6A  becomes: ASHRAE 169-2006-6A.
+  # institution: CEC, value: 3  becomes: CEC T24-CEC3.
+  #
+  # @param model [OpenStudio::Model::Model] the model
+  # @return [String] the string representation of the climate zone,
+  # empty string if no climate zone is present in the model.
+  def model_standards_climate_zone(model)
+    climate_zone = ''
+    model.getClimateZones.climateZones.each do |cz|
+      if cz.institution == 'ASHRAE'
+        next if cz.value == '' # Skip blank ASHRAE climate zones put in by OpenStudio Application
+        climate_zone = if cz.value == '7' || cz.value == '8'
+                         "ASHRAE 169-2006-#{cz.value}A"
+                       else
+                         "ASHRAE 169-2006-#{cz.value}"
+                       end
+      elsif cz.institution == 'CEC'
+        next if cz.value == '' # Skip blank ASHRAE climate zones put in by OpenStudio Application
+        climate_zone = "CEC T24-CEC#{cz.value}"
+      end
+    end
+    return climate_zone
+  end
+
+  # Sets the climate zone object in the model using
+  # the correct institution based on the climate zone specified
+  # in the format used by the openstudio-standards lookups.
+  # Clears out any climate zones previously added to the model.
+  #
+  # @param model [OpenStudio::Model::Model] the model
+  # @param climate_zone [String] the climate zone in openstudio-standards format.
+  # For example: ASHRAE 169-2006-2A, CEC T24-CEC3
+  # @return [Boolean] returns true if successful, false if not
+  def model_set_climate_zone(model, climate_zone)
+    # Remove previous climate zones from the model
+    model.getClimateZones.clear
+    # Split the string into the correct institution and value
+    if climate_zone.include? 'ASHRAE 169-2006-'
+      model.getClimateZones.setClimateZone('ASHRAE', climate_zone.gsub('ASHRAE 169-2006-', ''))
+    elsif climate_zone.include? 'CEC T24-CEC'
+      model.getClimateZones.setClimateZone('CEC', climate_zone.gsub('CEC T24-CEC', ''))
+
+    end
+    return true
+  end
+
+
+  # This method return the building ratio of subsurface_area / surface_type_area where surface_type can be "Wall" or "RoofCeiling"
+  def get_outdoor_subsurface_ratio(model, surface_type = "Wall")
+    surface_area = 0.0
+    sub_surface_area = 0
+    all_surfaces = []
+    all_sub_surfaces = []
+    model.getSpaces.sort.each do |space|
+      zone = space.thermalZone
+      zone_multiplier = nil
+      next if zone.empty?
+      zone_multiplier = zone.get.multiplier
+      space.surfaces.sort.each do |surface|
+        if surface.outsideBoundaryCondition == 'Outdoors' and surface.surfaceType == surface_type
+          surface_area += surface.grossArea * zone_multiplier
+          surface.subSurfaces.sort.each do |sub_surface|
+            sub_surface_area += sub_surface.grossArea * sub_surface.multiplier * zone_multiplier
+          end
+        end
+      end
+    end
+    return fdwr = (sub_surface_area / surface_area)
+  end
+
+  # Loads a osm as a starting point.
+  #
+  # @return [Bool] returns true if successful, false if not
+  def load_initial_osm(osm_file)
+    # Load the geometry .osm
+    unless File.exist?(osm_file)
+      raise("The initial osm path: #{osm_file} does not exist.")
+    end
+    osm_model_path = OpenStudio::Path.new(osm_file.to_s)
+    # Upgrade version if required.
+    version_translator = OpenStudio::OSVersion::VersionTranslator.new
+    model = version_translator.loadModel(osm_model_path).get
+    validate_initial_model(model)
+    return model
+  end
+
+  def validate_initial_model(model)
+    if model.getBuildingStorys.empty?
+      OpenStudio.logFree(OpenStudio::Error, 'openstudio.model.Model', "Please assign Spaces to BuildingStorys the geometry model.")
+    end
+    if model.getThermalZones.empty?
+      OpenStudio.logFree(OpenStudio::Error, 'openstudio.model.Model', "Please assign Spaces to ThermalZones the geometry model.")
+    end
+    if model.getBuilding.standardsNumberOfStories.empty?
+      OpenStudio.logFree(OpenStudio::Error, 'openstudio.model.Model', "Please define Building.standardsNumberOfStories the geometry model.")
+    end
+    if model.getBuilding.standardsNumberOfAboveGroundStories.empty?
+      OpenStudio.logFree(OpenStudio::Error, 'openstudio.model.Model', "Please define Building.standardsNumberOfAboveStories in the geometry model.")
+    end
+
+    if @space_type_map.nil? || @space_type_map.empty?
+      @space_type_map = get_space_type_maps_from_model(model)
+      if @space_type_map.nil? || @space_type_map.empty?
+        OpenStudio.logFree(OpenStudio::Error, 'openstudio.model.Model', "Please assign SpaceTypes in the geometry model or in standards database #{@space_type_map}.")
+      else
+        @space_type_map = @space_type_map.sort.to_h
+        OpenStudio.logFree(OpenStudio::Info, 'openstudio.model.Model', "Loaded space type map from model")
+      end
+    end
+
+    # ensure that model is intersected correctly.
+    model.getSpaces.each {|space1| model.getSpaces.each {|space2| space1.intersectSurfaces(space2)}}
+    # Get multipliers from TZ in model. Need this for HVAC contruction.
+    @space_multiplier_map = {}
+    model.getSpaces.sort.each do |space|
+      @space_multiplier_map[space.name.get] = space.multiplier if space.multiplier > 1
+    end
+    OpenStudio.logFree(OpenStudio::Info, 'openstudio.model.Model', 'Finished adding geometry')
+    unless @space_multiplier_map.empty?
+      OpenStudio.logFree(OpenStudio::Info, 'openstudio.model.Model', "Found mulitpliers for space #{@space_multiplier_map}")
+    end
+  end
+
+
+  # Determines how ventilation for the standard is specified.
+  # When 'Sum', all min OA flow rates are added up.  Commonly used by 90.1.
+  # When 'Maximum', only the biggest OA flow rate.  Used by T24.
+  #
+  # @param model [OpenStudio::Model::Model] the model
+  # @return [String] the ventilation method, either Sum or Maximum
+  def model_ventilation_method(model)
+    ventilation_method = 'Sum'
+    return ventilation_method
+  end
+
+  # Removes all of the unused ResourceObjects
+  # (Curves, ScheduleDay, Material, etc.) from the model.
+  #
+  # @return [Bool] returns true if successful, false if not
+  def model_remove_unused_resource_objects(model)
+    model.getResourceObjects.sort.each do |obj|
+      if obj.directUseCount.zero?
+        OpenStudio::logFree(OpenStudio::Debug, 'openstudio.standards.Model', "#{obj.name} is unused; it will be removed.")
+        model.removeObject(obj.handle)
+      end
+    end
+
+    return true
+  end
+
+
   private
 
   # Helper method to fill in hourly values
@@ -4376,18 +4691,7 @@ class Standard
         OpenStudio.logFree(OpenStudio::Info, 'openstudio.model.Model', "Loaded space type map from osm file: #{osm_model_path}")
       end
     end
-
-    # ensure that model is intersected correctly.
-    model.getSpaces.each { |space1| model.getSpaces.each { |space2| space1.intersectSurfaces(space2) } }
-    # Get multipliers from TZ in model. Need this for HVAC contruction.
-    @space_multiplier_map = {}
-    model.getSpaces.sort.each do |space|
-      @space_multiplier_map[space.name.get] = space.multiplier if space.multiplier > 1
-    end
-    OpenStudio.logFree(OpenStudio::Info, 'openstudio.model.Model', 'Finished adding geometry')
-    unless @space_multiplier_map.empty?
-      OpenStudio.logFree(OpenStudio::Info, 'openstudio.model.Model', "Found mulitpliers for space #{@space_multiplier_map}")
-    end
     return model
+
   end
 end

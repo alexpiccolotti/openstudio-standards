@@ -33,10 +33,10 @@ Standard.class_eval do
     model_add_hvac(model, @instvarbuilding_type, climate_zone, @prototype_input, epw_file)
     model_custom_hvac_tweaks(building_type, climate_zone, @prototype_input, model)
     model_add_swh(model, @instvarbuilding_type, climate_zone, @prototype_input, epw_file)
-    model_custom_swh_tweaks(model, @instvarbuilding_type, climate_zone, @prototype_input)
     model_add_exterior_lights(model, @instvarbuilding_type, climate_zone, @prototype_input)
     model_add_occupancy_sensors(model, @instvarbuilding_type, climate_zone)
     model_add_design_days_and_weather_file(model, climate_zone, epw_file)
+    model_add_daylight_savings(model)
     model_add_ground_temperatures(model, @instvarbuilding_type, climate_zone)
     model_apply_sizing_parameters(model, @instvarbuilding_type)
     model.yearDescription.get.setDayofWeekforStartDay('Sunday')
@@ -63,6 +63,9 @@ Standard.class_eval do
     model_modify_oa_controller(model)
     # Apply the HVAC efficiency standard
     model_apply_hvac_efficiency_standard(model, climate_zone)
+    # Apply prototype changes that supersede the HVAC efficiency standard
+    model_apply_prototype_hvac_efficiency_adjustments(model)
+    model_custom_swh_tweaks(model, @instvarbuilding_type, climate_zone, @prototype_input)
     # Fix EMS references.
     # Temporary workaround for OS issue #2598
     model_temp_fix_ems_references(model)
@@ -70,8 +73,10 @@ Standard.class_eval do
     # only four zones in large hotel have daylighting controls
     # todo: YXC to merge to the main function
     model_add_daylighting_controls(model)
+    model_custom_daylighting_tweaks(building_type, climate_zone, @prototype_input, model)
     model_update_exhaust_fan_efficiency(model)
     model_update_fan_efficiency(model)
+    model_remove_unused_resource_objects(model)
     # Add output variables for debugging
     model_request_timeseries_outputs(model) if debug
     # If measure model is passed, then replace measure model with new model created here.
@@ -1006,6 +1011,37 @@ Standard.class_eval do
     end
   end
 
+  # Set up daylight savings
+  #
+  def model_add_daylight_savings(model)
+
+    start_date  = '2nd Sunday in March'
+    end_date = '1st Sunday in November'
+
+    runperiodctrl_daylgtsaving = model.getRunPeriodControlDaylightSavingTime
+    runperiodctrl_daylgtsaving.setStartDate(start_date)
+    runperiodctrl_daylgtsaving.setEndDate(end_date)
+
+    OpenStudio.logFree(OpenStudio::Info, 'openstudio.prototype.Model', "Set Daylight Saving Start Date to #{start_date} and end date to #{end_date}.")
+  end
+
+  # Adds holidays to the model.
+  # @todo enable holidays once supported inside OpenStudio schedules
+  def model_add_holidays(model)
+    newyear = OpenStudio::Model::RunPeriodControlSpecialDays.new('1/1', model)
+    newyear.setName('New Years')
+    newyear.setSpecialDayType('Holiday')
+
+    fourth = OpenStudio::NthDayOfWeekInMonth.new(4)
+    thurs = OpenStudio::DayOfWeek.new('Thursday')
+    nov = OpenStudio::MonthOfYear.new('November')
+    thanksgiving = OpenStudio::Model::RunPeriodControlSpecialDays.new(fourth, thurs, nov, model)
+    thanksgiving.setName('Thanksgiving')
+    thanksgiving.setSpecialDayType('Holiday')
+
+    OpenStudio.logFree(OpenStudio::Info, 'openstudio.prototype.Model', "Added holidays: New Years, Thanksgiving.")
+  end
+
   # Changes the infiltration coefficients for the prototype vintages.
   #
   # @param (see #add_constructions)
@@ -1077,6 +1113,20 @@ Standard.class_eval do
     model.getControllerWaterCoils.sort.each {|obj| controller_water_coil_set_convergence_limits(obj)}
 
     OpenStudio.logFree(OpenStudio::Info, 'openstudio.model.Model', 'Finished applying prototype HVAC assumptions.')
+  end
+
+  # Applies the Prototype Building assumptions that contradict/supersede
+  # the given standard.
+  #
+  # @param model [OpenStudio::Model::Model] the model
+  def model_apply_prototype_hvac_efficiency_adjustments(model)
+
+    # ERVs
+    # Applies the DOE Prototype Building assumption that ERVs use
+    # enthalpy wheels and therefore exceed the minimum effectiveness specified by 90.1
+    model.getHeatExchangerAirToAirSensibleAndLatents.each {|obj| heat_exchanger_air_to_air_sensible_and_latent_apply_prototype_efficiency(obj)}
+
+    return true
   end
 
   def model_add_debugging_variables(model, type)

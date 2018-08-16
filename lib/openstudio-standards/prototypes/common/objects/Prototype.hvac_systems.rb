@@ -1462,6 +1462,14 @@ class Standard
     # set air loop availability controls and night cycle manager, after oa system added
     air_loop.setAvailabilitySchedule(hvac_op_sch)
     air_loop.setNightCycleControlType('CycleOnAny')
+    avail_mgr = air_loop.availabilityManager
+    if avail_mgr.is_initialized
+      avail_mgr = avail_mgr.get
+      if avail_mgr.to_AvailabilityManagerNightCycle.is_initialized
+        avail_mgr = avail_mgr.to_AvailabilityManagerNightCycle.get
+        avail_mgr.setCyclingRunTime(1800)
+      end
+    end
 
     # hook the VAV system to each zone
     thermal_zones.each do |zone|
@@ -1745,6 +1753,15 @@ class Standard
     sizing_system.setSizingOption('Coincident')
     sizing_system.setAllOutdoorAirinCooling(false)
     sizing_system.setAllOutdoorAirinHeating(false)
+    air_loop.setNightCycleControlType('CycleOnAny')
+    avail_mgr = air_loop.availabilityManager
+    if avail_mgr.is_initialized
+      avail_mgr = avail_mgr.get
+      if avail_mgr.to_AvailabilityManagerNightCycle.is_initialized
+        avail_mgr = avail_mgr.to_AvailabilityManagerNightCycle.get
+        avail_mgr.setCyclingRunTime(1800)
+      end
+    end
 
     # create fan
     fan = create_fan_by_name(model, 'VAV_default', fan_name: "#{air_loop.name} Fan")
@@ -2428,6 +2445,14 @@ class Standard
       # set air loop availability controls and night cycle manager, after oa system added
       air_loop.setAvailabilitySchedule(hvac_op_sch)
       air_loop.setNightCycleControlType('CycleOnAny')
+      avail_mgr = air_loop.availabilityManager
+      if avail_mgr.is_initialized
+        avail_mgr = avail_mgr.get
+        if avail_mgr.to_AvailabilityManagerNightCycle.is_initialized
+          avail_mgr = avail_mgr.to_AvailabilityManagerNightCycle.get
+          avail_mgr.setCyclingRunTime(1800)
+        end
+      end
 
       # create a diffuser and attach the zone/diffuser pair to the air loop
       diffuser = OpenStudio::Model::AirTerminalSingleDuctUncontrolled.new(model, model.alwaysOnDiscreteSchedule)
@@ -3791,6 +3816,11 @@ class Standard
         htg_coil.setMaximumOutdoorDryBulbTemperatureforDefrostOperation(OpenStudio.convert(40.0, 'F', 'C').get)
         htg_coil.setCrankcaseHeaterCapacity(crank_case_heat_w)
         htg_coil.setMaximumOutdoorDryBulbTemperatureforCrankcaseHeaterOperation(OpenStudio.convert(crank_case_max_temp_f, 'F', 'C').get)
+        htg_coil.setDefrostStrategy('ReverseCycle')
+        htg_coil.setDefrostControl('OnDemand')
+        htg_coil.resetDefrostTimePeriodFraction
+
+        # Supplemental Heating Coil
 
         # create supplemental heating coil
         supplemental_htg_coil = create_coil_heating_electric(model, name: "#{air_loop.name} Supplemental Htg Coil")
